@@ -1,121 +1,159 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
-#include "audio_io.h"
+#include <string.h>
+#include <time.h>
 #include "ring_buffer.h"
-#include <math.h>
 
-#define SAMPLE_RATE 48000
-#define CHANNELS 1
-#define PERIOD_SIZE 256
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
+
 #define RING_BUFFER_SIZE 8192
+#define PROCESS_CHUNK_SIZE 256
 
-static volatile int running = 1;
-
-void signal_handler(int sig) {
-    (void)sig;
-    running = 0;
-}
-
-int main(void) {
-    printf("Real-Time Audio Processor - Passthrough Test\n");
-    printf("Sample rate: %d Hz, Channels: %d, Period: %d frames\n",
-           SAMPLE_RATE, CHANNELS, PERIOD_SIZE);
-    printf("Press Ctrl+C to stop...\n\n");
+int main(int argc, char *argv[]) {
+    printf("Real-Time Audio Processor - File Processing Mode\n");
+    printf("=================================================\n\n");
     
-    signal(SIGINT, signal_handler);
+    // Input/output file paths
+    const char *input_file = (argc > 1) ? argv[1] : "test_audio/input.wav";
+    const char *output_file = (argc > 2) ? argv[2] : "test_audio/output.wav";
     
-    // Open audio devices
-    audio_device_t *capture = audio_capture_open("default", SAMPLE_RATE, CHANNELS, PERIOD_SIZE);
-    if (!capture) {
-        fprintf(stderr, "Failed to open capture device\n");
+    printf("Input:  %s\n", input_file);
+    printf("Output: %s\n", output_file);
+    
+    // Load input WAV file
+    unsigned int channels;
+    unsigned int sample_rate;
+    drwav_uint64 total_frames;
+    
+    float *input_data = drwav_open_file_and_read_pcm_frames_f32(
+        input_file, &channels, &sample_rate, &total_frames, NULL
+    );
+    
+    if (!input_data) {
+        fprintf(stderr, "Error: Failed to open input file '%s'\n", input_file);
         return 1;
     }
     
-    audio_device_t *playback = audio_playback_open("default", SAMPLE_RATE, CHANNELS, PERIOD_SIZE);
-    if (!playback) {
-        fprintf(stderr, "Failed to open playback device\n");
-        audio_device_close(capture);
+    printf("Loaded: %llu frames, %u Hz, %u channel(s)\n", 
+           (unsigned long long)total_frames, sample_rate, channels);
+    
+    if (channels != 1) {
+        fprintf(stderr, "Error: Only mono (1 channel) audio supported for now\n");
+        drwav_free(input_data, NULL);
         return 1;
     }
     
     // Create ring buffer
     ring_buffer_t *rb = ring_buffer_create(RING_BUFFER_SIZE);
     if (!rb) {
-        fprintf(stderr, "Failed to create ring buffer\n");
-        audio_device_close(capture);
-        audio_device_close(playback);
+        fprintf(stderr, "Error: Failed to create ring buffer\n");
+        drwav_free(input_data, NULL);
         return 1;
     }
     
-    printf("Audio devices opened successfully\n");
-    printf("Running passthrough (you should hear yourself with slight delay)...\n\n");
-    
-    float *capture_buffer = malloc(PERIOD_SIZE * CHANNELS * sizeof(float));
-    float *playback_buffer = malloc(PERIOD_SIZE * CHANNELS * sizeof(float));
-    
-    if (!capture_buffer || !playback_buffer) {
-        fprintf(stderr, "Failed to allocate buffers\n");
-        free(capture_buffer);
-        free(playback_buffer);
+    // Allocate output buffer
+    float *output_data = malloc(total_frames * sizeof(float));
+    if (!output_data) {
+        fprintf(stderr, "Error: Failed to allocate output buffer\n");
         ring_buffer_free(rb);
-        audio_device_close(capture);
-        audio_device_close(playback);
+        drwav_free(input_data, NULL);
         return 1;
     }
     
-    // Prefill ring buffer with silence to avoid initial underrun
-    float silence[PERIOD_SIZE] = {0};
-    for (int i = 0; i < 4; i++) {
-        ring_buffer_write(rb, silence, PERIOD_SIZE);
-    }
+    printf("\nProcessing through ring buffer...\n");
     
-// Test tone generator (440 Hz sine wave)
-    float phase = 0.0f;
-    float phase_increment = 2.0f * 3.14159f * 440.0f / SAMPLE_RATE; // 440 Hz (A note)
+    // Start timing
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     
-    printf("Generating 440 Hz test tone...\n");
+    // Process audio through ring buffer
+    size_t input_pos = 0;
+    size_t output_pos = 0;
+    size_t total_processed = 0;
     
-    // Main loop
-    while (running) {
-        // Generate sine wave into capture buffer
-        for (size_t i = 0; i < PERIOD_SIZE; i++) {
-            capture_buffer[i] = 0.3f * sinf(phase);  // 0.3 = volume (not too loud)
-            phase += phase_increment;
-            if (phase >= 2.0f * 3.14159f) {
-                phase -= 2.0f * 3.14159f;
+    // Prefill ring buffer
+    size_t prefill = PROCESS_CHUNK_SIZE * 2;
+    if (prefill > total_frames) prefill = total_frames;
+    ring_buffer_write(rb, input_data, prefill);
+    input_pos = prefill;
+    
+    while (output_pos < total_frames) {
+        size_t to_write = 0;
+        size_t to_read = 0;
+
+        // Write more input if available and buffer has space
+        if (input_pos < total_frames) {
+            size_t available_space = ring_buffer_write_available(rb);
+            to_write = PROCESS_CHUNK_SIZE;
+            if (to_write > available_space) to_write = available_space;
+            if (to_write > total_frames - input_pos) to_write = total_frames - input_pos;
+            if (to_write > 0) {
+                ring_buffer_write(rb, &input_data[input_pos], to_write);
+                input_pos += to_write;
             }
         }
-        
-        // Write to ring buffer
-        size_t written = ring_buffer_write(rb, capture_buffer, PERIOD_SIZE);
-        if (written < PERIOD_SIZE) {
-            fprintf(stderr, "Ring buffer overflow! Dropped %zd frames\n", PERIOD_SIZE - written);
-        }
-        
-        // Read from ring buffer
-        size_t frames_available = ring_buffer_read(rb, playback_buffer, PERIOD_SIZE);
-        
-        // Playback audio
-        if (frames_available > 0) {
-            ssize_t frames_written = audio_playback_write(playback, playback_buffer, frames_available);
-            if (frames_written < 0) {
-                fprintf(stderr, "Playback error\n");
-                break;
+
+        // Read and process output
+        size_t available_data = ring_buffer_read_available(rb);
+        to_read = PROCESS_CHUNK_SIZE;
+        if (to_read > available_data) to_read = available_data;
+        if (to_read > total_frames - output_pos) to_read = total_frames - output_pos;
+        if (to_read > 0) {
+            ring_buffer_read(rb, &output_data[output_pos], to_read);
+            output_pos += to_read;
+            total_processed += to_read;
+            // Progress indicator
+            if (total_processed % (sample_rate / 10) == 0) {
+                float progress = (float)total_processed / total_frames * 100.0f;
+                printf("\rProgress: %.1f%%", progress);
+                fflush(stdout);
             }
+        }
+
+        // Safety: break if nothing is happening
+        if (to_write == 0 && to_read == 0) {
+            break;
         }
     }
     
-    printf("\nStopping...\n");
+    // End timing
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    
+    printf("\rProgress: 100.0%%\n");
+    printf("\nProcessed %zu frames in %.3f seconds\n", total_processed, elapsed);
+    printf("Processing speed: %.2fx realtime\n", 
+           (total_frames / (double)sample_rate) / elapsed);
+    
+    // Write output WAV file
+    printf("Writing output file...\n");
+    drwav wav;
+    drwav_data_format format;
+    format.container = drwav_container_riff;
+    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    format.channels = channels;
+    format.sampleRate = sample_rate;
+    format.bitsPerSample = 32;
+    
+    if (!drwav_init_file_write(&wav, output_file, &format, NULL)) {
+        fprintf(stderr, "Error: Failed to create output file '%s'\n", output_file);
+        free(output_data);
+        ring_buffer_free(rb);
+        drwav_free(input_data, NULL);
+        return 1;
+    }
+    
+    drwav_uint64 frames_written = drwav_write_pcm_frames(&wav, total_frames, output_data);
+    drwav_uninit(&wav);
+    
+    printf("Wrote %llu frames to '%s'\n", (unsigned long long)frames_written, output_file);
     
     // Cleanup
-    free(capture_buffer);
-    free(playback_buffer);
+    free(output_data);
     ring_buffer_free(rb);
-    audio_device_close(capture);
-    audio_device_close(playback);
+    drwav_free(input_data, NULL);
     
-    printf("Cleanup complete\n");
+    printf("\n✓ Done! Play the output file to hear the result.\n");
     return 0;
 }
