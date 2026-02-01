@@ -6,7 +6,7 @@ SRC_DIR = src
 TEST_DIR = tests
 
 # Source files
-SRCS = $(SRC_DIR)/ring_buffer.c $(SRC_DIR)/audio_io.c
+SRCS = $(SRC_DIR)/ring_buffer.c $(SRC_DIR)/audio_io.c $(SRC_DIR)/effects.c
 
 # Main executable
 TARGET = audio_processor
